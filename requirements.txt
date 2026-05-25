@@ -1,0 +1,11 @@
+fastapi==0.135.3
+uvicorn[standard]==0.44.0
+pydantic==2.13.0
+python-multipart==0.0.26
+python-dotenv==1.2.2
+httpx==0.27.2
+numpy==2.4.4
+google-generativeai==0.8.6
+supabase==2.7.4
+tavily-python==0.7.23
+youtube-transcript-api==1.2.4
