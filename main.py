@@ -30,6 +30,8 @@ import uuid
 import asyncio  # 引入 asyncio 以處理並行任務
 import httpx
 import logging
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import pad, unpad
 from dotenv import load_dotenv
 from google.api_core import exceptions as google_exceptions
 try:
@@ -63,40 +65,52 @@ if not TAVILY_API_KEY:
 genai.configure(api_key=GEMINI_API_KEY)
 tavily_client = AsyncTavilyClient(api_key=TAVILY_API_KEY)
 
-# --- ECPay 綠界金流 ---
-ECPAY_MERCHANT_ID = os.getenv("ECPAY_MERCHANT_ID")
-ECPAY_HASH_KEY = os.getenv("ECPAY_HASH_KEY")
-ECPAY_HASH_IV = os.getenv("ECPAY_HASH_IV")
-ECPAY_AIO_URL = os.getenv(
-    "ECPAY_AIO_URL",
-    "https://payment-stage.ecpay.com.tw/Cashier/AioCheckOut/V5",  # 未設定時走測試環境
-)
-ECPAY_RETURN_URL = os.getenv("ECPAY_RETURN_URL", "http://localhost:8000/api/ecpay/webhook")
-ECPAY_CLIENT_BACK_URL = os.getenv("ECPAY_CLIENT_BACK_URL", "http://localhost:3000")
+# --- NewebPay 藍新金流 ---
+NEWEBPAY_MERCHANT_ID = os.getenv("NEWEBPAY_MERCHANT_ID")
+NEWEBPAY_HASH_KEY = os.getenv("NEWEBPAY_HASH_KEY")
+NEWEBPAY_HASH_IV = os.getenv("NEWEBPAY_HASH_IV")
+# 測試環境預設 https://ccore.newebpay.com/MPG/mpg_gateway，正式環境是 https://core.newebpay.com/MPG/mpg_gateway
+NEWEBPAY_URL = os.getenv("NEWEBPAY_URL", "https://ccore.newebpay.com/MPG/mpg_gateway")
+NEWEBPAY_RETURN_URL = os.getenv("NEWEBPAY_RETURN_URL", "http://localhost:8000/api/newebpay/webhook")
 
 
-def _ecpay_url_encode(raw: str) -> str:
-    """模擬 .NET HttpUtility.UrlEncode：spaces → +，但 - _ . ! * ( ) 不編碼，最後全部轉小寫。"""
-    encoded = urllib.parse.quote_plus(raw).lower()
-    for old, new in (("%2d", "-"), ("%5f", "_"), ("%2e", "."),
-                     ("%21", "!"), ("%2a", "*"), ("%28", "("), ("%29", ")")):
-        encoded = encoded.replace(old, new)
-    return encoded
+def _newebpay_require_keys() -> None:
+    if not (NEWEBPAY_MERCHANT_ID and NEWEBPAY_HASH_KEY and NEWEBPAY_HASH_IV):
+        raise HTTPException(status_code=500, detail="藍新環境變數未設定完整")
 
 
-def ecpay_check_mac_value(params: dict) -> str:
-    """依綠界規範計算 CheckMacValue。"""
-    if not ECPAY_HASH_KEY or not ECPAY_HASH_IV:
-        raise HTTPException(status_code=500, detail="綠界 HashKey/HashIV 未設定")
-    filtered = {k: v for k, v in params.items() if k != "CheckMacValue"}
-    sorted_items = sorted(filtered.items(), key=lambda x: x[0].lower())
-    raw = (
-        f"HashKey={ECPAY_HASH_KEY}&"
-        + "&".join(f"{k}={v}" for k, v in sorted_items)
-        + f"&HashIV={ECPAY_HASH_IV}"
+def newebpay_encrypt(params: dict) -> str:
+    """AES-256-CBC 加密：URL-encoded query string → hex 字串（TradeInfo）。
+    HashKey 必須 32 bytes，HashIV 必須 16 bytes，否則 PyCryptodome 會丟 ValueError。"""
+    _newebpay_require_keys()
+    raw = urllib.parse.urlencode(params)
+    cipher = AES.new(
+        NEWEBPAY_HASH_KEY.encode("utf-8"),
+        AES.MODE_CBC,
+        NEWEBPAY_HASH_IV.encode("utf-8"),
     )
-    encoded = _ecpay_url_encode(raw)
-    return hashlib.sha256(encoded.encode("utf-8")).hexdigest().upper()
+    encrypted = cipher.encrypt(pad(raw.encode("utf-8"), AES.block_size))
+    return encrypted.hex()
+
+
+def newebpay_decrypt(hex_str: str) -> dict:
+    """AES-256-CBC 解密 webhook 的 TradeInfo（hex）→ JSON dict。
+    由於下單時 RespondType=JSON，藍新回拋的明文也是 JSON 字串。"""
+    _newebpay_require_keys()
+    cipher = AES.new(
+        NEWEBPAY_HASH_KEY.encode("utf-8"),
+        AES.MODE_CBC,
+        NEWEBPAY_HASH_IV.encode("utf-8"),
+    )
+    decrypted = unpad(cipher.decrypt(bytes.fromhex(hex_str)), AES.block_size)
+    return json.loads(decrypted.decode("utf-8"))
+
+
+def newebpay_trade_sha(trade_info_hex: str) -> str:
+    """SHA256("HashKey={KEY}&{TradeInfo}&HashIV={IV}") 後轉大寫；下單與驗 webhook 都用同一條規則。"""
+    _newebpay_require_keys()
+    raw = f"HashKey={NEWEBPAY_HASH_KEY}&{trade_info_hex}&HashIV={NEWEBPAY_HASH_IV}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest().upper()
 
 # 初始化模型 (維持原本的 Gemini 2.5 Flash)
 model_text = genai.GenerativeModel('gemini-2.5-flash')
@@ -1412,77 +1426,95 @@ async def delete_note(note_id: str, user=Depends(get_current_user)):
         raise
 
 
-# --- ECPay 綠界金流 ---
+# --- NewebPay 藍新金流 ---
 
-@app.post("/api/create-ecpay-order")
-async def create_ecpay_order(user=Depends(get_current_user)):
-    if not (ECPAY_MERCHANT_ID and ECPAY_HASH_KEY and ECPAY_HASH_IV):
-        raise HTTPException(status_code=500, detail="綠界環境變數未設定完整")
+@app.post("/api/create-newebpay-order")
+async def create_newebpay_order(user=Depends(get_current_user)):
+    _newebpay_require_keys()
 
-    # Taipei time for MerchantTradeDate
     tpe_now = datetime.now(timezone(timedelta(hours=8)))
-    trade_no = "CB" + tpe_now.strftime("%y%m%d%H%M%S") + "".join(
+    # MerchantOrderNo 規範：英數，最長 30 字
+    merchant_order_no = "CB" + tpe_now.strftime("%y%m%d%H%M%S") + "".join(
         random.choices(string.ascii_uppercase + string.digits, k=4)
-    )  # e.g. CB2604201830XXXX (20 chars)
+    )
 
-    params = {
-        "MerchantID": ECPAY_MERCHANT_ID,
-        "MerchantTradeNo": trade_no,
-        "MerchantTradeDate": tpe_now.strftime("%Y/%m/%d %H:%M:%S"),
-        "PaymentType": "aio",
-        "TotalAmount": 300,
-        "TradeDesc": "CourseBuilder Pro Subscription",
-        "ItemName": "專業版 AI 課程一個月",
-        "ReturnURL": ECPAY_RETURN_URL,
-        "ClientBackURL": ECPAY_CLIENT_BACK_URL,
-        "ChoosePayment": "Credit",
-        "EncryptType": 1,
-        "CustomField1": str(user.id),   # 用來識別使用者
+    order = {
+        "MerchantID": NEWEBPAY_MERCHANT_ID,
+        "RespondType": "JSON",
+        "TimeStamp": str(int(tpe_now.timestamp())),
+        "Version": "2.0",
+        "MerchantOrderNo": merchant_order_no,
+        "Amt": 300,
+        "ItemDesc": "專業版 AI 課程",
+        "Email": getattr(user, "email", "") or "",
+        # NotifyURL 是 server-to-server 回呼，會更新 is_premium；
+        # ReturnURL 是使用者付款成功後的瀏覽器導回頁面，先用同一個 URL 簡化設定。
+        "NotifyURL": NEWEBPAY_RETURN_URL,
+        "Custom1": str(user.id),
     }
-    params["CheckMacValue"] = ecpay_check_mac_value(params)
-    # 讓前端拿到正確的 AIO 網址，不要在前端寫死測試/正式 URL
-    return {"action_url": ECPAY_AIO_URL, "params": params}
+    trade_info = newebpay_encrypt(order)
+    trade_sha = newebpay_trade_sha(trade_info)
+
+    return {
+        "action_url": NEWEBPAY_URL,
+        "MerchantID": NEWEBPAY_MERCHANT_ID,
+        "TradeInfo": trade_info,
+        "TradeSha": trade_sha,
+        "Version": "2.0",
+    }
 
 
-@app.post("/api/ecpay/webhook")
-async def ecpay_webhook(request: Request):
-    """接收綠界付款結果通知（不經 JWT 驗證）。必須回 '1|OK'。"""
-    # 手動以 UTF-8 解析 form body，避免 Starlette 預設編碼把中文（如 RtnMsg='交易成功'）
-    # 當 Latin-1 讀進來，導致 CheckMacValue 算法與綠界端不一致。
+@app.post("/api/newebpay/webhook")
+async def newebpay_webhook(request: Request):
+    """接收藍新付款結果通知（server-to-server，不經 JWT 驗證）。"""
     raw = await request.body()
     try:
         decoded = raw.decode("utf-8")
     except UnicodeDecodeError:
         decoded = raw.decode("latin-1")
-    data = {k: v for k, v in urllib.parse.parse_qsl(decoded, keep_blank_values=True)}
+    form = {k: v for k, v in urllib.parse.parse_qsl(decoded, keep_blank_values=True)}
 
-    received_mac = data.get("CheckMacValue", "")
+    received_trade_info = form.get("TradeInfo", "")
+    received_trade_sha = form.get("TradeSha", "")
+    if not received_trade_info or not received_trade_sha:
+        logger.warning("[NewebPay] webhook 缺 TradeInfo / TradeSha")
+        return PlainTextResponse("ERR")
+
+    # 1) 驗 TradeSha（防竄改）
     try:
-        expected_mac = ecpay_check_mac_value(data)
-    except Exception as e:
-        print(f"[ECPay] 計算 CheckMacValue 失敗：{e}")
-        return PlainTextResponse("0|ERR")
+        expected_sha = newebpay_trade_sha(received_trade_info)
+    except HTTPException:
+        # 環境變數沒設好就不可能驗證成功，直接回 ERR
+        logger.warning("[NewebPay] HashKey/HashIV 未設定，無法驗 webhook")
+        return PlainTextResponse("ERR")
 
-    if received_mac.upper() != expected_mac.upper():
-        print(f"[ECPay] CheckMacValue mismatch.")
-        print(f"[ECPay]   received = {received_mac}")
-        print(f"[ECPay]   expected = {expected_mac}")
-        # 排序後的欄位方便對照綠界文件自行重算
-        sorted_items = sorted(
-            ((k, v) for k, v in data.items() if k != "CheckMacValue"),
-            key=lambda x: x[0].lower(),
+    if expected_sha != received_trade_sha.upper():
+        logger.warning(
+            f"[NewebPay] TradeSha mismatch: received={received_trade_sha} expected={expected_sha}"
         )
-        print(f"[ECPay]   sorted params = {sorted_items}")
-        return PlainTextResponse("0|ERR")
+        return PlainTextResponse("ERR")
 
-    if data.get("RtnCode") != "1":
-        print(f"付款未成功，RtnCode={data.get('RtnCode')}，MerchantTradeNo={data.get('MerchantTradeNo')}")
-        return PlainTextResponse("1|OK")
+    # 2) 解密 TradeInfo
+    try:
+        info = newebpay_decrypt(received_trade_info)
+    except Exception as e:
+        logger.warning(f"[NewebPay] 解密失敗：{e}")
+        return PlainTextResponse("ERR")
 
-    user_id = data.get("CustomField1")
+    status = info.get("Status")
+    result = info.get("Result") or {}
+    merchant_order_no = result.get("MerchantOrderNo")
+
+    if status != "SUCCESS":
+        logger.info(
+            f"[NewebPay] 付款未成功 status={status} order={merchant_order_no}"
+        )
+        return PlainTextResponse("OK")
+
+    user_id = result.get("Custom1")
     if not user_id:
-        print("⚠️ Webhook 缺 CustomField1 (user_id)")
-        return PlainTextResponse("1|OK")
+        logger.warning("[NewebPay] webhook 缺 Custom1 (user_id)")
+        return PlainTextResponse("OK")
 
     try:
         await sb_execute(
@@ -1492,8 +1524,10 @@ async def ecpay_webhook(request: Request):
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }).execute()
         )
-        print(f"✅ 用戶 {user_id} 升級為 Premium，MerchantTradeNo={data.get('MerchantTradeNo')}")
+        logger.info(
+            f"✅ 用戶 {user_id} 升級為 Premium，MerchantOrderNo={merchant_order_no}"
+        )
     except Exception as e:
-        print(f"⚠️ 更新 profiles 失敗：{e}")
+        logger.warning(f"[NewebPay] 更新 profiles 失敗：{e}")
 
-    return PlainTextResponse("1|OK")
+    return PlainTextResponse("OK")

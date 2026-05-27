@@ -9,3 +9,4 @@ google-generativeai==0.8.6
 supabase==2.7.4
 tavily-python==0.7.23
 youtube-transcript-api==1.2.4
+pycryptodome==3.23.0
